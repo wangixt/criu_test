@@ -1,0 +1,9 @@
+syntax = "proto2";
+
+message criu_dfd {
+    required uint32 pid = 1;
+    required uint32 file_type = 2;
+    required uint32 org_fd = 3;
+    required string file_name = 4;
+    required uint32 flag = 5;
+}
