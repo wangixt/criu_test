@@ -16,6 +16,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <sched.h>
 #include "criu-plugin.h"
 #include "../criu-npu.pb-c.h"
 #include "cr_options.h"
@@ -27,7 +28,16 @@ struct cr_options opts;
 #ifndef NPU_DEVICE
 #define NPU_DEVICE "/dev/davinci_manager"
 #endif
-
+/*
+ * Avoid including <sys/mount.h> because CRIU's include paths can shadow
+ * system headers and pull in compel-generated headers in a standalone build.
+ */
+#ifndef MNT_DETACH
+#define MNT_DETACH 2
+#endif
+extern int mount(const char *source, const char *target, const char *fstype,
+                 unsigned long flags, const void *data);
+extern int umount2(const char *target, int flags);
 /* From npu_plugin.c (built with -DNPU_PLUGIN_UT) */
 extern int write_fp(FILE *fp, const void *buf, const size_t buf_len);
 extern int read_fp(FILE *fp, void *buf, const size_t buf_len);
@@ -67,6 +77,76 @@ static int mk_tmpdir(char *out, size_t outsz, const char *tag)
         snprintf(out, outsz, "%s", tmpl);
         return 0;
 }
+static int mount_tmpfs(const char *dir)
+{
+        if (mount("tmpfs", dir, "tmpfs", 0, "mode=755") < 0)
+                return -1;
+        return 0;
+}
+static void umount_best_effort(const char *dir)
+{
+        (void)umount2(dir, MNT_DETACH);
+}
+static int make_chrdev(const char *path, int maj, int min, mode_t mode,
+                       uid_t uid, gid_t gid);
+/*
+ * scan_npu_devices() in the plugin always scans "/dev". To keep unit tests
+ * hermetic and avoid scanning/modifying the real host /dev, run tests inside
+ * a private mount namespace and mount a tmpfs on /dev, then recreate the few
+ * device nodes the tests rely on.
+ *
+ * This requires root/CAP_SYS_ADMIN (typical for CRIU UT runs).
+ * The Makefile wraps execution with 'unshare --mount --propagation private'
+ * to guarantee host isolation even if the inner MS_PRIVATE call below
+ * does not take effect on this system's kernel configuration.
+ */
+#ifndef MS_REC
+#define MS_REC 16384
+#endif
+#ifndef MS_PRIVATE
+#define MS_PRIVATE 262144
+#endif
+static int devns_entered;
+static int recreate_basic_dev_nodes(uid_t uid, gid_t gid)
+{
+        /* null(1,3) zero(1,5) full(1,7) */
+        (void)unlink("/dev/null");
+        (void)unlink("/dev/zero");
+        (void)unlink("/dev/full");
+        if (make_chrdev("/dev/null", 1, 3, 0666, uid, gid) < 0)
+                return -1;
+        if (make_chrdev("/dev/zero", 1, 5, 0666, uid, gid) < 0)
+                return -1;
+        if (make_chrdev("/dev/full", 1, 7, 0666, uid, gid) < 0)
+                return -1;
+        return 0;
+}
+static int mount_test_devfs(void)
+{
+        uid_t uid = getuid();
+        gid_t gid = getgid();
+        /* (Re)mount tmpfs on /dev */
+        (void)umount2("/dev", MNT_DETACH);
+        (void)mkdir("/dev", 0755);
+        if (mount_tmpfs("/dev") < 0)
+                return -1;
+        return recreate_basic_dev_nodes(uid, gid);
+}
+static int enter_private_dev_namespace(void)
+{
+        if (devns_entered)
+                return 0;
+        if (unshare(CLONE_NEWNS) < 0) {
+                perror("unshare(CLONE_NEWNS)");
+                return -1;
+        }
+        if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) < 0) {
+                perror("mount --make-rprivate /");
+                return -1;
+        }
+        devns_entered = 1;
+        return mount_test_devfs();
+}
 static int get_hw_user(uid_t *uid, gid_t *gid)
 {
         struct passwd *pwd = getpwnam("HwHiAiUser");
@@ -85,47 +165,6 @@ static int make_chrdev(const char *path, int maj, int min, mode_t mode,
         (void)chmod(path, mode);
         return 0;
 }
-
-/*
- * Fake /dev directory used for device scanning in tests.
- *
- * scan_npu_devices() reads NPU_UT_DEV_DIR (set to fake_dev_dir) instead of
- * the real /dev, so tests never touch the host's /dev at all.  Tests that
- * need real character devices (/dev/null, /dev/full, /dev/zero) still open
- * those paths directly; the kernel always exposes them on the real /dev.
- */
-static char fake_dev_dir[PATH_MAX];
-
-static void fake_dev_path(char *buf, size_t bufsz, const char *name)
-{
-        snprintf(buf, bufsz, "%s/%s", fake_dev_dir, name);
-}
-
-static int setup_fake_dev_dir(void)
-{
-        uid_t uid = getuid();
-        gid_t gid = getgid();
-        char path[PATH_MAX];
-
-        if (mk_tmpdir(fake_dev_dir, sizeof(fake_dev_dir), "npu-ut-dev") < 0) {
-                perror("mk_tmpdir (fake dev dir)");
-                return -1;
-        }
-        setenv("NPU_UT_DEV_DIR", fake_dev_dir, 1);
-
-        /* Populate with the basic char devices tests rely on */
-        fake_dev_path(path, sizeof(path), "null");
-        if (make_chrdev(path, 1, 3, 0666, uid, gid) < 0)
-                return -1;
-        fake_dev_path(path, sizeof(path), "zero");
-        if (make_chrdev(path, 1, 5, 0666, uid, gid) < 0)
-                return -1;
-        fake_dev_path(path, sizeof(path), "full");
-        if (make_chrdev(path, 1, 7, 0666, uid, gid) < 0)
-                return -1;
-        return 0;
-}
-
 static int write_img_bytes(const char *imgdir, int id, const void *data,
                            size_t data_len, size_t data_write_len)
 {
@@ -199,21 +238,22 @@ static int run_in_child(int (*fn)(void))
 static int ut_scan_opendir_fail(void)
 {
         /*
-         * Force scan_npu_devices() to hit opendir() failure by temporarily
-         * pointing NPU_UT_DEV_DIR at a path that does not exist.
-         * No /dev manipulation needed.
+         * Force scan_npu_devices() to hit opendir("/dev") failure path by
+         * temporarily removing /dev in our private mount namespace.
          */
+        UT_ASSERT(enter_private_dev_namespace() == 0);
         setenv("NPU_UT_HW_USER_MODE", "notfound", 1);
         unsetenv("SNAPSHOT_LINK_REMAP_DST");
         unsetenv("SNAPSHOT_LINK_REMAP_SRC");
         UT_ASSERT(npu_plugin_init(CR_PLUGIN_STAGE__RESTORE) == 0);
         setenv("NPU_UT_HW_USER_MODE", "found", 1);
-        setenv("NPU_UT_DEV_DIR", "/tmp/npu-ut-no-such-dev-dir-99999", 1);
+        umount_best_effort("/dev");
+        (void)rmdir("/dev");
         unsetenv("SNAPSHOT_LINK_REMAP_DST");
         unsetenv("SNAPSHOT_LINK_REMAP_SRC");
         (void)npu_plugin_init(CR_PLUGIN_STAGE__RESTORE);
-        /* Restore the real fake dev dir */
-        setenv("NPU_UT_DEV_DIR", fake_dev_dir, 1);
+        /* Restore a usable /dev for following tests */
+        UT_ASSERT(mount_test_devfs() == 0);
         return 0;
 }
 static int ut_fp_io_errors(void)
@@ -312,18 +352,17 @@ static int ut_link_remap_branches(void)
 {
         uid_t uid = 0;
         gid_t gid = 0;
-        char dpath[PATH_MAX];
         int r;
         unsetenv("SNAPSHOT_LINK_REMAP_DST");
         unsetenv("SNAPSHOT_LINK_REMAP_SRC");
         unsetenv("NPU_UT_CR_SYSTEM_RET");
+        UT_ASSERT(enter_private_dev_namespace() == 0);
         if (get_hw_user(&uid, &gid) < 0) {
                 uid = getuid();
                 gid = getgid();
         }
-        fake_dev_path(dpath, sizeof(dpath), "davinci_manager");
-        (void)unlink(dpath);
-        UT_ASSERT(make_chrdev(dpath, 1, 7, 0660, uid, gid) == 0);
+        (void)unlink("/dev/davinci_manager");
+        UT_ASSERT(make_chrdev("/dev/davinci_manager", 1, 7, 0660, uid, gid) == 0);
         /* Cover init restore (without env vars) */
         UT_ASSERT(npu_plugin_init(CR_PLUGIN_STAGE__RESTORE) == 0);
         /* Cover init restore link remap (with env vars) + cr_system stub */
@@ -481,7 +520,6 @@ static int ut_update_vmamap_dup_fail(void)
 static int ut_recreate_and_restore_paths(void)
 {
         char root[PATH_MAX], imgdir[PATH_MAX];
-        char dpath[PATH_MAX];
         uid_t uid = 0;
         gid_t gid = 0;
         int imgfd = -1;
@@ -491,22 +529,22 @@ static int ut_recreate_and_restore_paths(void)
                 return 1;
         snprintf(imgdir, sizeof(imgdir), "%s/img", root);
         UT_ASSERT(mkdir(imgdir, 0755) == 0);
+        UT_ASSERT(enter_private_dev_namespace() == 0);
         /* Ensure scan_npu_devices will accept our node even if HwHiAiUser exists */
         if (get_hw_user(&uid, &gid) < 0) {
                 uid = getuid();
                 gid = getgid();
         }
-        fake_dev_path(dpath, sizeof(dpath), "davinci_manager");
-        (void)unlink(dpath);
-        UT_ASSERT(make_chrdev(dpath, 1, 5, 0660, uid, gid) == 0);
+        (void)unlink("/dev/davinci_manager");
+        UT_ASSERT(make_chrdev("/dev/davinci_manager", 1, 5, 0660, uid, gid) == 0);
         unsetenv("SNAPSHOT_LINK_REMAP_DST");
         unsetenv("SNAPSHOT_LINK_REMAP_SRC");
         (void)npu_plugin_init(CR_PLUGIN_STAGE__RESTORE);
         /* Run a second time to cover list cleanup paths in scan_npu_devices(). */
         (void)npu_plugin_init(CR_PLUGIN_STAGE__RESTORE);
         /* Create mismatch to exercise recreate path */
-        UT_ASSERT(unlink(dpath) == 0);
-        UT_ASSERT(make_chrdev(dpath, 1, 7, 0660, uid, gid) == 0);
+        UT_ASSERT(unlink("/dev/davinci_manager") == 0);
+        UT_ASSERT(make_chrdev("/dev/davinci_manager", 1, 7, 0660, uid, gid) == 0);
         imgfd = open(imgdir, O_RDONLY | O_DIRECTORY);
         UT_ASSERT(imgfd >= 0);
         npu_ut_set_img_dirfd(imgfd);
@@ -540,7 +578,7 @@ static int ut_recreate_and_restore_paths(void)
         UT_ASSERT(ret >= 0);
         close(ret);
         /* stat(d->name) fail -> -ENODEV */
-        UT_ASSERT(unlink(dpath) == 0);
+        UT_ASSERT(unlink("/dev/davinci_manager") == 0);
         ret = npu_plugin_restore_file(6);
         UT_ASSERT(ret == -ENODEV);
         /* dump_file fstat error */
@@ -563,13 +601,9 @@ static int ut_recreate_and_restore_paths(void)
 int main(void)
 {
         int total = 0, passed = 0;
-        /*
-         * Set up an isolated tmpdir as the fake /dev for device scanning.
-         * scan_npu_devices() reads NPU_UT_DEV_DIR (set by setup_fake_dev_dir)
-         * so tests never touch the real /dev.
-         */
-        if (setup_fake_dev_dir() != 0) {
-                fprintf(stderr, "Failed to set up fake dev dir\n");
+        /* Ensure plugin scan/recreate logic uses an isolated /dev */
+        if (enter_private_dev_namespace() != 0) {
+                fprintf(stderr, "Failed to enter private mount namespace or mount /dev\n");
                 return 1;
         }
 #define RUN_TEST(name, fn)                                                   \
