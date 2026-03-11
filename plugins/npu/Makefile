@@ -69,8 +69,10 @@ endif
 
 UT_BIN      := unit/npu_plugin_ut
 UT_NPU_DEVICE ?= /dev/null
+UT_NPU_SCAN_DIR ?= /tmp/npu_ut_dev
 UT_CFLAGS   := -O0 -g --coverage -DNPU_PLUGIN_UT -Wall -Wextra -Werror -Wno-unused-parameter -D_GNU_SOURCE \
--Wno-sign-compare -Wno-sign-conversion -Wno-format-truncation -DNPU_DEVICE=\"$(UT_NPU_DEVICE)\"
+-Wno-sign-compare -Wno-sign-conversion -Wno-format-truncation -DNPU_DEVICE=\"$(UT_NPU_DEVICE)\" \
+-DNPU_SCAN_DIR=\"$(UT_NPU_SCAN_DIR)\"
 UT_LDFLAGS  := --coverage -Wl,--wrap=strdup -Wl,--wrap=getpwnam_r
 UT_LIBS     := -lpthread -lrt -lprotobuf-c
 
@@ -90,7 +92,7 @@ unit/%.o: unit/%.c
 
 unit-run: unit-clean unit
 	$(RM) -f *.gcda *.gcov unit/*.gcda unit/*.gcov
-	unshare --mount --propagation private ./$(UT_BIN)
+	./$(UT_BIN)
 
 unit-gcov: unit-run
 	gcov -b -c npu_plugin.c
