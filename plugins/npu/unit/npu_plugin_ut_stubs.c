@@ -1,5 +1,4 @@
 #include <errno.h>
-#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -103,81 +102,4 @@ int img_streamer_open(const char *path, int mode)
 	(void)mode;
 	errno = ENOTSUP;
 	return -1;
-}
-
-/*
- * Stub for CRIU's logging backend.  In unit tests all messages go to stderr
- * with a simple level prefix for easy log-based assertions.
- */
-void print_on_level(unsigned int loglevel, const char *format, ...)
-{
-	static const char *const prefixes[] = {
-		"",      /* LOG_MSG   (0) */
-		"ERR: ", /* LOG_ERROR (1) */
-		"WARN: ",/* LOG_WARN  (2) */
-		"INFO: ",/* LOG_INFO  (3) */
-		"DBG: ", /* LOG_DEBUG (4) */
-	};
-	va_list ap;
-
-	if (loglevel < sizeof(prefixes) / sizeof(prefixes[0]))
-		fprintf(stderr, "%s", prefixes[loglevel]);
-	else
-		fprintf(stderr, "[L%u] ", loglevel);
-
-	va_start(ap, format);
-	vfprintf(stderr, format, ap);
-	va_end(ap);
-}
-
-unsigned int log_get_loglevel(void)
-{
-	return 4; /* LOG_DEBUG: show everything in unit tests */
-}
-
-/*
- * Stub for criu_get_image_dir() / npu_ut_set_img_dirfd().
- *
- * npu_plugin.c calls criu_get_image_dir() to obtain the image directory fd.
- * In unit tests we control this fd via npu_ut_set_img_dirfd().
- */
-static int ut_img_dirfd = -1;
-
-void npu_ut_set_img_dirfd(int fd)
-{
-	ut_img_dirfd = fd;
-}
-
-int criu_get_image_dir(void)
-{
-	return ut_img_dirfd;
-}
-
-/*
- * Stub for cr_system().
- *
- * In unit tests cr_system() does NOT execute any external commands.
- * The return value is controlled via the NPU_UT_CR_SYSTEM_RET env var:
- *   - set to a number: return that number
- *   - not set or not a valid number: return 0 (success)
- */
-int cr_system(int in, int out, int err, char *cmd, char *const argv[],
-	      unsigned flags)
-{
-	const char *ret_str = getenv("NPU_UT_CR_SYSTEM_RET");
-	(void)in;
-	(void)out;
-	(void)err;
-	(void)cmd;
-	(void)argv;
-	(void)flags;
-
-	if (ret_str) {
-		char *end;
-		long val = strtol(ret_str, &end, 10);
-
-		if (*end == '\0')
-			return (int)val;
-	}
-	return 0;
 }
