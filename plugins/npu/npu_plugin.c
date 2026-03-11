@@ -74,7 +74,14 @@ static int scan_npu_devices(void)
 	char buf[1024];
 	uid_t target_uid;
 	int result = 0;
-	pr_info("Scanning /dev for NPU devices...\n");
+#ifdef NPU_PLUGIN_UT
+	const char *dev_dir = getenv("NPU_UT_DEV_DIR");
+	if (!dev_dir)
+		dev_dir = "/dev";
+#else
+	const char *dev_dir = "/dev";
+#endif
+	pr_info("Scanning %s for NPU devices...\n", dev_dir);
 
 	int ret = getpwnam_r("HwHiAiUser", &pwd_buf, buf, sizeof(buf), &pwd_result);
 	if (ret == 0) {
@@ -89,8 +96,8 @@ static int scan_npu_devices(void)
 		return -1;
 	}
 
-	if (!(dir = opendir("/dev"))) {
-		pr_perror("Failed to open /dev directory");
+	if (!(dir = opendir(dev_dir))) {
+		pr_perror("Failed to open %s directory", dev_dir);
 		return -1;
 	}
 
@@ -104,13 +111,13 @@ static int scan_npu_devices(void)
 	while ((dent = readdir(dir))) {
 		if (dent->d_type != DT_CHR) continue;
 
-		dir_len = snprintf(path, sizeof(path), "/dev/%s", dent->d_name);
+		dir_len = snprintf(path, sizeof(path), "%s/%s", dev_dir, dent->d_name);
 		if (dir_len < 0) {
 			pr_err("Encoding error in filename: %s", dent->d_name);
 			continue;
 		}
 		if ((size_t)(dir_len) >= sizeof(path)) {
-			pr_warn("Path too long: /dev/%s (truncated)", dent->d_name);
+			pr_warn("Path too long: %s/%s (truncated)", dev_dir, dent->d_name);
 			// The path has been truncated, but processing continues for safety
 			path[sizeof(path) - 1] = '\0';
 		}
