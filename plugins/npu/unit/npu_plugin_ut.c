@@ -28,15 +28,10 @@ struct cr_options opts;
 #define ND_TYPE__LOOPBACK 1
 #endif
 
-/* Match path used by npu_plugin_update_vmamap(); can be overridden via -DNPU_DEVICE="..." */
 #ifndef NPU_DEVICE
 #define NPU_DEVICE "/dev/davinci_manager"
 #endif
 
-/*
- * Avoid including <sys/mount.h> because CRIU's include paths can shadow
- * system headers and pull in compel-generated headers in a standalone build.
- */
 #ifndef MNT_DETACH
 #define MNT_DETACH 2
 #endif
@@ -74,7 +69,7 @@ extern void npu_ut_set_img_dirfd(int fd);
 #define UT_ASSERT(expr)                                                   \
 	do {                                                              \
 		if (!(expr))                                              \
-			UT_FAIL("ASSERT failed: %s (%s:%d)", #expr,        \
+			UT_FAIL("ASSERT failed: %s (%s:%d)", #expr,      \
 				__FILE__, __LINE__);                      \
 	} while (0)
 
@@ -110,10 +105,11 @@ static int make_chrdev(const char *path, int maj, int min, mode_t mode,
 #ifndef MS_PRIVATE
 #define MS_PRIVATE 262144
 #endif
-#ifndef MS_BIND
-#define MS_BIND 4096
-#endif
 
+/*
+ * Set to 1 by main() when run inside the chroot created by
+ * run_ut_chroot.sh, so enter_private_dev_namespace() is a no-op.
+ */
 static int devns_entered;
 
 static int recreate_basic_dev_nodes(uid_t uid, gid_t gid)
@@ -143,150 +139,8 @@ static int mount_test_devfs(void)
 }
 
 /*
- * Set up a chroot-based isolated test environment.
- *
- * Mount namespaces alone do NOT isolate file-system data operations on the
- * underlying block device.  A naive "mount tmpfs on /dev" inside a mount
- * namespace can still corrupt the host /dev if the tmpfs is ever unmounted
- * and the test continues to create/delete files on the now-exposed real /dev
- * directory.
- *
- * To prevent this we:
- *   1. Create a new mount namespace with all propagation set to private.
- *   2. Mount a tmpfs at a temp directory to serve as our new root.
- *   3. Populate it with /dev (on its own tmpfs), /tmp, /run, /proc.
- *   4. Bind-mount the build directory so gcov can persist .gcda files.
- *   5. chroot() into the new root.
- *
- * After this, every path-based operation resolves within the tmpfs tree,
- * making it impossible to corrupt the host /dev regardless of what the
- * tests do with mount/umount/rmdir inside the chroot.
- */
-static int mkdirs_for_path(const char *base, const char *suffix)
-{
-	char buf[PATH_MAX];
-	char *p;
-
-	snprintf(buf, sizeof(buf), "%s%s", base, suffix);
-	for (p = buf + strlen(base) + 1; *p; p++) {
-		if (*p == '/') {
-			*p = '\0';
-			(void)mkdir(buf, 0755);
-			*p = '/';
-		}
-	}
-	(void)mkdir(buf, 0755);
-	return 0;
-}
-
-static int setup_chroot_env(void)
-{
-	char root[PATH_MAX];
-	char path[PATH_MAX];
-	char cwd[PATH_MAX];
-	uid_t uid = getuid();
-	gid_t gid = getgid();
-
-	if (!getcwd(cwd, sizeof(cwd))) {
-		perror("getcwd");
-		return -1;
-	}
-
-	snprintf(root, sizeof(root), "/tmp/npu-ut-root.XXXXXX");
-	if (!mkdtemp(root)) {
-		perror("mkdtemp for chroot root");
-		return -1;
-	}
-
-	if (unshare(CLONE_NEWNS) < 0) {
-		perror("unshare(CLONE_NEWNS)");
-		return -1;
-	}
-	if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) < 0) {
-		perror("mount --make-rprivate /");
-		return -1;
-	}
-
-	if (mount("tmpfs", root, "tmpfs", 0, "mode=755,size=128m") < 0) {
-		perror("mount tmpfs on chroot root");
-		return -1;
-	}
-
-	snprintf(path, sizeof(path), "%s/dev", root);
-	if (mkdir(path, 0755) < 0) {
-		perror("mkdir /dev in chroot");
-		return -1;
-	}
-	snprintf(path, sizeof(path), "%s/tmp", root);
-	if (mkdir(path, 01777) < 0) {
-		perror("mkdir /tmp in chroot");
-		return -1;
-	}
-	snprintf(path, sizeof(path), "%s/run", root);
-	if (mkdir(path, 0755) < 0) {
-		perror("mkdir /run in chroot");
-		return -1;
-	}
-	snprintf(path, sizeof(path), "%s/proc", root);
-	if (mkdir(path, 0555) < 0) {
-		perror("mkdir /proc in chroot");
-		return -1;
-	}
-
-	/*
-	 * Mount a separate tmpfs on /dev so that tests which call
-	 * umount("/dev") + rmdir("/dev") only remove the inner tmpfs
-	 * mount point, leaving the root tmpfs untouched.
-	 */
-	snprintf(path, sizeof(path), "%s/dev", root);
-	if (mount("tmpfs", path, "tmpfs", 0, "mode=755") < 0) {
-		perror("mount tmpfs on chroot /dev");
-		return -1;
-	}
-
-	snprintf(path, sizeof(path), "%s/dev/null", root);
-	if (make_chrdev(path, 1, 3, 0666, uid, gid) < 0)
-		return -1;
-	snprintf(path, sizeof(path), "%s/dev/zero", root);
-	if (make_chrdev(path, 1, 5, 0666, uid, gid) < 0)
-		return -1;
-	snprintf(path, sizeof(path), "%s/dev/full", root);
-	if (make_chrdev(path, 1, 7, 0666, uid, gid) < 0)
-		return -1;
-
-	snprintf(path, sizeof(path), "%s/proc", root);
-	if (mount("proc", path, "proc", 0, NULL) < 0)
-		fprintf(stderr, "WARN: mount proc in chroot failed: %s\n",
-			strerror(errno));
-
-	/*
-	 * Bind-mount the build directory into the chroot at the same
-	 * absolute path so that gcov can write .gcda files back to the
-	 * real filesystem when the process exits.
-	 */
-	mkdirs_for_path(root, cwd);
-	snprintf(path, sizeof(path), "%s%s", root, cwd);
-	if (mount(cwd, path, NULL, MS_BIND, NULL) < 0)
-		fprintf(stderr, "WARN: bind-mount %s failed, gcov may not work: %s\n",
-			cwd, strerror(errno));
-
-	if (chroot(root) < 0) {
-		perror("chroot");
-		return -1;
-	}
-	if (chdir("/") < 0) {
-		perror("chdir / after chroot");
-		return -1;
-	}
-
-	devns_entered = 1;
-	return 0;
-}
-
-/*
- * After setup_chroot_env(), the process is already fully isolated.
- * This function is retained so that test helpers which call it
- * (e.g. ut_scan_opendir_fail) continue to compile and work.
+ * When run inside the chroot (devns_entered==1), this is a no-op.
+ * Kept as a fallback for direct execution without the wrapper script.
  */
 static int enter_private_dev_namespace(void)
 {
@@ -518,8 +372,7 @@ static int ut_misc_hook_funcs(void)
 	ret = npu_plugin_update_vmamap(NULL, 0, 0, &new_off, &ufd);
 	UT_ASSERT(ret == 0);
 
-	ret = npu_plugin_update_vmamap(NPU_DEVICE, 0, 0, &new_off,
-				       &ufd);
+	ret = npu_plugin_update_vmamap(NPU_DEVICE, 0, 0, &new_off, &ufd);
 	UT_ASSERT(ret == 1);
 	UT_ASSERT(ufd >= 0);
 	close(ufd);
@@ -597,10 +450,7 @@ static int ut_update_inetsk_more_branches(void)
 	r = npu_plugin_update_inetsk(1, AF_INET, 0, src, dst);
 	UT_ASSERT(r == 0);
 
-	src[0] = 0;
-	src[1] = 0;
-	src[2] = 0;
-	src[3] = 1;
+	src[0] = 0; src[1] = 0; src[2] = 0; src[3] = 1;
 	r = npu_plugin_update_inetsk(1, AF_INET6, 0, src, dst);
 	UT_ASSERT(r == 0);
 
@@ -613,10 +463,8 @@ static int ut_update_inetsk_more_branches(void)
 	r = npu_plugin_update_inetsk(2, AF_INET, 0, src, dst);
 	UT_ASSERT(r < 0);
 
-	src[0] = 0x11111111;
-	src[1] = 0x22222222;
-	src[2] = 0x33333333;
-	src[3] = 0x44444444;
+	src[0] = 0x11111111; src[1] = 0x22222222;
+	src[2] = 0x33333333; src[3] = 0x44444444;
 	r = npu_plugin_update_inetsk(3, AF_INET6, 0, src, dst);
 	UT_ASSERT(r < 0);
 
@@ -661,8 +509,7 @@ static int ut_update_vmamap_memfd_create_fail(void)
 	unsetenv("SNAPSHOT_LINK_REMAP_SRC");
 	setenv("NPU_UT_HW_USER_MODE", "found", 1);
 	(void)npu_plugin_init(CR_PLUGIN_STAGE__RESTORE);
-	ret = npu_plugin_update_vmamap(NPU_DEVICE, 0, 0, &new_off,
-				       &ufd);
+	ret = npu_plugin_update_vmamap(NPU_DEVICE, 0, 0, &new_off, &ufd);
 	UT_ASSERT(ret == -ENOTSUP);
 
 	for (i = 0; i < n; i++)
@@ -685,8 +532,7 @@ static int ut_update_vmamap_dup_fail(void)
 	unsetenv("SNAPSHOT_LINK_REMAP_SRC");
 	setenv("NPU_UT_HW_USER_MODE", "found", 1);
 	UT_ASSERT(npu_plugin_init(CR_PLUGIN_STAGE__RESTORE) == 0);
-	ret = npu_plugin_update_vmamap(NPU_DEVICE, 0, 0, &new_off,
-				       &ufd);
+	ret = npu_plugin_update_vmamap(NPU_DEVICE, 0, 0, &new_off, &ufd);
 	UT_ASSERT(ret == 1);
 	close(ufd);
 
@@ -702,8 +548,7 @@ static int ut_update_vmamap_dup_fail(void)
 		fds[n++] = fd;
 	}
 
-	ret = npu_plugin_update_vmamap(NPU_DEVICE, 0, 0, &new_off,
-				       &ufd);
+	ret = npu_plugin_update_vmamap(NPU_DEVICE, 0, 0, &new_off, &ufd);
 	UT_ASSERT(ret == -1);
 
 	for (i = 0; i < n; i++)
@@ -749,28 +594,23 @@ static int ut_recreate_and_restore_paths(void)
 	ret = npu_plugin_restore_file(999);
 	UT_ASSERT(ret == -EINVAL || ret == -ENODEV);
 
-	UT_ASSERT(write_dfd_img(imgdir, 1, 10, O_RDONLY, "/dev/zero", true,
-				false) == 0);
+	UT_ASSERT(write_dfd_img(imgdir, 1, 10, O_RDONLY, "/dev/zero", true, false) == 0);
 	ret = npu_plugin_restore_file(1);
 	UT_ASSERT(ret < 0);
 
-	UT_ASSERT(write_dfd_img(imgdir, 2, 10, O_RDONLY, "/dev/zero", false,
-				true) == 0);
+	UT_ASSERT(write_dfd_img(imgdir, 2, 10, O_RDONLY, "/dev/zero", false, true) == 0);
 	ret = npu_plugin_restore_file(2);
 	UT_ASSERT(ret < 0);
 
-	UT_ASSERT(write_dfd_img(imgdir, 3, 10, O_RDONLY, "", false, false) ==
-		  0);
+	UT_ASSERT(write_dfd_img(imgdir, 3, 10, O_RDONLY, "", false, false) == 0);
 	ret = npu_plugin_restore_file(3);
 	UT_ASSERT(ret == -ENOTSUP);
 
-	UT_ASSERT(write_dfd_img(imgdir, 4, 10, O_RDONLY, "/no/such/file", false,
-				false) == 0);
+	UT_ASSERT(write_dfd_img(imgdir, 4, 10, O_RDONLY, "/no/such/file", false, false) == 0);
 	ret = npu_plugin_restore_file(4);
 	UT_ASSERT(ret < 0);
 
-	UT_ASSERT(write_dfd_img(imgdir, 5, 10, O_RDONLY, "/dev/zero", false,
-				false) == 0);
+	UT_ASSERT(write_dfd_img(imgdir, 5, 10, O_RDONLY, "/dev/zero", false, false) == 0);
 	ret = npu_plugin_restore_file(5);
 	UT_ASSERT(ret >= 0);
 	close(ret);
@@ -802,27 +642,24 @@ int main(void)
 	int total = 0, passed = 0;
 
 	/*
-	 * Use chroot-based isolation: all filesystem operations
-	 * (including /dev manipulation) happen inside a tmpfs-backed
-	 * chroot, so the host /dev is never touched.
+	 * The test binary is expected to run inside a chroot set up by
+	 * unit/run_ut_chroot.sh.  All /dev operations happen inside the
+	 * chroot's tmpfs, so the host /dev is never touched.
 	 */
-	if (setup_chroot_env() != 0) {
-		fprintf(stderr, "Failed to set up isolated test environment\n");
-		return 1;
-	}
+	devns_entered = 1;
 
 #define RUN_TEST(name, fn)                                                   \
 	do {                                                                 \
 		int __rc;                                                    \
-		total++;                                                    \
-		__rc = (fn);                                                \
-		if (__rc == 0) {                                            \
-			passed++;                                           \
+		total++;                                                     \
+		__rc = (fn);                                                 \
+		if (__rc == 0) {                                             \
+			passed++;                                            \
 		} else {                                                     \
-			fprintf(stderr, "TEST FAIL: %s\n", (name));         \
+			fprintf(stderr, "TEST FAIL: %s\n", (name));          \
 			fprintf(stderr, "SUMMARY: %d/%d passed\n", passed,  \
-				total);                                     \
-			return 1;                                          \
+				total);                                      \
+			return 1;                                            \
 		}                                                            \
 	} while (0)
 
