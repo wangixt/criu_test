@@ -549,7 +549,7 @@ static int ut_update_vmamap_dup_fail(void)
 	}
 
 	ret = npu_plugin_update_vmamap(NPU_DEVICE, 0, 0, &new_off, &ufd);
-	UT_ASSERT(ret == -1);
+	UT_ASSERT(ret == -ENOTSUP);
 
 	for (i = 0; i < n; i++)
 		close(fds[i]);
