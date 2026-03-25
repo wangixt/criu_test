@@ -90,7 +90,7 @@ unit/%.o: unit/%.c
 
 unit-run: unit-clean unit
 	$(RM) -f *.gcda *.gcov unit/*.gcda unit/*.gcov
-	./$(UT_BIN)
+	bash unit/run_ut_chroot.sh ./$(UT_BIN)
 
 unit-gcov: unit-run
 	gcov -b -c npu_plugin.c

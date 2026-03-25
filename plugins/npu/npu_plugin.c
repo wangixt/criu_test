@@ -111,7 +111,6 @@ static int scan_npu_devices(void)
 		}
 		if ((size_t)(dir_len) >= sizeof(path)) {
 			pr_warn("Path too long: /dev/%s (truncated)", dent->d_name);
-			// The path has been truncated, but processing continues for safety
 			path[sizeof(path) - 1] = '\0';
 		}
 
@@ -119,12 +118,11 @@ static int scan_npu_devices(void)
 			pr_perror("stat failed for %s", path);
 			return -1;
 		}
-		
+
 		if (target_uid != (uid_t)-1 && st.st_uid != target_uid) {
 			continue;
 		}
 
-		// create new device node
 		struct npu_device_node *node = xmalloc(sizeof(*node));
 		if (!node) {
 			pr_err("Failed to allocate memory for device node");
@@ -145,7 +143,7 @@ static int scan_npu_devices(void)
 			node->info.n_uid);
 
 		list_add_tail(&node->list, &npu_device_list);
-		
+
 		pr_debug("Found NPU device: %s (Maj:%d Min:%d UID:%d)",
 				path, major(st.st_rdev), minor(st.st_rdev), st.st_uid);
 	}
@@ -233,8 +231,39 @@ int write_img_file(char *path, const void *buf, const size_t buf_len)
 		return -errno;
 
 	ret = write_fp(fp, buf, buf_len);
-	fclose(fp); /* this will also close fd */
+	fclose(fp);
 	return ret;
+}
+
+#ifndef NPU_DEVICE
+#define NPU_DEVICE "/dev/davinci_manager"
+#endif
+#define TMP_MEM_DEVICE "npu_evasive"
+static int cached_npu_memfd = -1;
+static pthread_mutex_t npu_memfd_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void init_cached_memfd(void)
+{
+	pthread_mutex_lock(&npu_memfd_mutex);
+	if (cached_npu_memfd < 0) {
+		int fd = memfd_create(TMP_MEM_DEVICE, MFD_CLOEXEC);
+		if (fd < 0) {
+			pr_err("memfd_create failed: %s\n", strerror(errno));
+		} else {
+			cached_npu_memfd = fd;
+		}
+	}
+	pthread_mutex_unlock(&npu_memfd_mutex);
+}
+
+static void close_cached_memfd(void)
+{
+	pthread_mutex_lock(&npu_memfd_mutex);
+	if (cached_npu_memfd >= 0) {
+		close(cached_npu_memfd);
+		cached_npu_memfd = -1;
+	}
+	pthread_mutex_unlock(&npu_memfd_mutex);
 }
 
 #define LINK_REMAP_DST "SNAPSHOT_LINK_REMAP_DST"
@@ -245,6 +274,7 @@ int npu_plugin_init(int stage)
 	pr_info("initialized: %s (Davinci NPU)\n", CR_PLUGIN_DESC.name);
 
 	if (stage == CR_PLUGIN_STAGE__RESTORE) {
+		init_cached_memfd();
 
 		int scan_result = scan_npu_devices();
 		if (scan_result != 0) {
@@ -289,6 +319,7 @@ void npu_plugin_fini(int stage, int ret)
 	char *dst = NULL;
 	char *src = NULL;
 	if (stage == CR_PLUGIN_STAGE__RESTORE) {
+		close_cached_memfd();
 		pr_info("restore stage for (Davinci NPU)\n");
 		return;
 	} else if (stage == CR_PLUGIN_STAGE__DUMP) {
@@ -351,7 +382,7 @@ int get_file_name_by_fd(int fd, char *buf)
 	}
 	if (tt >= MAX_FILE_NAME_LEN) {
 		pr_err("File path too long for fd %d, truncated\n", fd);
-		buf[MAX_FILE_NAME_LEN - 1] = '\0'; 
+		buf[MAX_FILE_NAME_LEN - 1] = '\0';
 		return -ENAMETOOLONG;
 	}
 
@@ -371,8 +402,8 @@ int get_fd_flags(int fd)
 int npu_plugin_dump_file(int fd, int id)
 {
 	int ret = 0;
-	char file_name_buf[MAX_FILE_NAME_LEN] = {0}; /* origin file name */
-	char img_name_buf[MAX_FILE_NAME_LEN] = {0}; /* image file name */
+	char file_name_buf[MAX_FILE_NAME_LEN] = {0};
+	char img_name_buf[MAX_FILE_NAME_LEN] = {0};
 	CriuDfd *cd = NULL;
 	struct stat st;
 	int flag = 0;
@@ -449,7 +480,6 @@ static int do_recreate_davinci_devs(void)
 
 	pr_info("Recreating NPU devices...\n");
 	int devices_recreated = 0;
-	// recreate node
 	struct npu_device_node *device;
 
 	list_for_each_entry(device, &npu_device_list, list) {
@@ -568,16 +598,12 @@ out:
 }
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RESTORE_EXT_FILE, npu_plugin_restore_file)
 
-
-#define NPU_DEVICE "/dev/davinci_manager"
-#define TMP_MEM_DEVICE "npu_evasive"
 /* return 0 if no match found
  * return -1 for error.
  * return 1 if vmap map must be adjusted.
- * TODO: NPU device driver should to handle vmamap
-*/
+ */
 int npu_plugin_update_vmamap(
-const char *in_path, const uint64_t addr, const uint64_t old_offset, uint64_t *new_offset, int *updated_fd)
+	const char *in_path, const uint64_t addr, const uint64_t old_offset, uint64_t *new_offset, int *updated_fd)
 {
 	if (!in_path) {
 		pr_warn("npu_plugin_update_vmamap in_path is NULL\n");
@@ -586,13 +612,22 @@ const char *in_path, const uint64_t addr, const uint64_t old_offset, uint64_t *n
 	if (strcmp(in_path, NPU_DEVICE) != 0)
 		return 0;
 
-	*new_offset = 0;
-	*updated_fd = memfd_create(TMP_MEM_DEVICE, MFD_CLOEXEC);
-	if (*updated_fd < 0) {
-		pr_err("memfd_create failed: %s\n", strerror(errno));
+	pthread_mutex_lock(&npu_memfd_mutex);
+
+	if (cached_npu_memfd < 0) {
+		pthread_mutex_unlock(&npu_memfd_mutex);
+		pr_err("npu_plugin_update_vmamap memfd_create failed\n");
 		return -ENOTSUP;
 	}
 
+	*new_offset = 0;
+	*updated_fd = fcntl(cached_npu_memfd, F_DUPFD_CLOEXEC, 0);
+	if (*updated_fd < 0) {
+		pthread_mutex_unlock(&npu_memfd_mutex);
+		pr_err("fcntl(F_DUPFD_CLOEXEC) failed: %s\n", strerror(errno));
+		return -1;
+	}
+	pthread_mutex_unlock(&npu_memfd_mutex);
 	pr_info("Handling %s addr=%#llx old_pgoff=%#llx -> new_pgoff=%#llx fd=%d\n",
 			in_path, (unsigned long long)addr, (unsigned long long)old_offset,
 			(unsigned long long)*new_offset, *updated_fd);
@@ -616,7 +651,6 @@ static int ipv4_to_ipv6_mapped(const char *ipv4_str, struct in6_addr *result)
 		pr_err("IPv6: inet_pton ip %s failed \n", ipv4_str);
 		return -EINVAL;
 	}
-	// Set the prefix for IPv4-mapped IPv6 addresses ::ffff:
 	result->s6_addr[10] = 0xff;
 	result->s6_addr[11] = 0xff;
 
@@ -625,7 +659,7 @@ static int ipv4_to_ipv6_mapped(const char *ipv4_str, struct in6_addr *result)
 	return 0;
 }
 
-static int handle_ipv4(const char *env_ip, uint32_t state, uint32_t *src_ip, uint32_t *dst_ip)
+static int handle_ipv4(const char *env_ip, uint32_t id, uint32_t state, uint32_t *src_ip, uint32_t *dst_ip)
 {
 	struct in_addr new_ip;
 	if (inet_pton(AF_INET, env_ip, &new_ip) <= 0) {
@@ -634,17 +668,16 @@ static int handle_ipv4(const char *env_ip, uint32_t state, uint32_t *src_ip, uin
 	}
 
 	src_ip[0] = new_ip.s_addr;
-	// loopback ip
 	if (state == ND_TYPE__LOOPBACK)
 		dst_ip[0] = new_ip.s_addr;
 
-	pr_info("IPv4 updated - src: %08x, dst: %08x \n", src_ip[0], (state == 1) ? dst_ip[0] : 0);
+	pr_info("IPv4 id: %u updated - src: %08x, dst: %08x \n", id, src_ip[0], (state == 1) ? dst_ip[0] : 0);
 	return 0;
 }
 
 #define IPV6_WORD_COUNT 4
 
-static int handle_ipv6(const char *env_ip, uint32_t state, uint32_t *src_ip, uint32_t *dst_ip)
+static int handle_ipv6(const char *env_ip, uint32_t id, uint32_t state, uint32_t *src_ip, uint32_t *dst_ip)
 {
 	struct in6_addr mapped_ipv6;
 	if (ipv4_to_ipv6_mapped(env_ip, &mapped_ipv6) < 0) {
@@ -652,12 +685,10 @@ static int handle_ipv6(const char *env_ip, uint32_t state, uint32_t *src_ip, uin
 		return -EINVAL;
 	}
 	uint32_t *mapped_words = (uint32_t *)&mapped_ipv6;
-	// Copy all IPv6 words to source IP array
 	for (int i = 0; i < IPV6_WORD_COUNT; i++)
-	src_ip[i] = mapped_words[i];
+		src_ip[i] = mapped_words[i];
 
-	pr_info("IPv6 updated - src: %08x:%08x:%08x:%08x\n", src_ip[0], src_ip[1], src_ip[2], src_ip[3]);
-	// loopback ip
+	pr_info("IPv6 id: %u updated - src: %08x:%08x:%08x:%08x\n", id, src_ip[0], src_ip[1], src_ip[2], src_ip[3]);
 	if (state == ND_TYPE__LOOPBACK) {
 		for (int i = 0; i < IPV6_WORD_COUNT; i++)
 			dst_ip[i] = mapped_words[i];
@@ -667,19 +698,19 @@ static int handle_ipv6(const char *env_ip, uint32_t state, uint32_t *src_ip, uin
 	return 0;
 }
 
-int npu_plugin_update_inetsk(uint32_t family, uint32_t state, uint32_t *src_ip, uint32_t *dst_ip) {
+int npu_plugin_update_inetsk(uint32_t id, uint32_t family, uint32_t state, uint32_t *src_ip, uint32_t *dst_ip)
+{
 	if (src_ip == NULL)
 		return 0;
 
-	// Skip 127.0.0.1
 	if (family == AF_INET) {
-    	pr_info("Start change IPv4 src : %08x, state=%u\n", src_ip[0], state);
-    	if (src_ip[0] == 0 || src_ip[0] == 0x7f000001) {
-        	return 0;
-    	}
+		pr_info("Start change IPv4 src : %08x, id=%u, state=%u\n", src_ip[0], id, state);
+		if (src_ip[0] == 0 || src_ip[0] == 0x7f000001) {
+			return 0;
+		}
 	} else {
-		pr_info("IPv6 src: %08x:%08x:%08x:%08x, state=%u\n",
-				src_ip[0], src_ip[1], src_ip[2], src_ip[3], state);
+		pr_info("IPv6 src: %08x:%08x:%08x:%08x, id=%u, state=%u\n",
+				src_ip[0], src_ip[1], src_ip[2], src_ip[3], id, state);
 		if ((src_ip[0] == 0) && (src_ip[1] == 0) && (src_ip[2] == 0) &&
 			(src_ip[3] == 0 || src_ip[3] == 1)) {
 			return 0;
@@ -688,14 +719,14 @@ int npu_plugin_update_inetsk(uint32_t family, uint32_t state, uint32_t *src_ip, 
 
 	const char *env_ip = getenv(INETSK_LOCAL_IPV4);
 	if (env_ip == NULL || strlen(env_ip) == 0) {
-		pr_warn("No IPv4 ENV config\n");
+		pr_warn("No IPv4 ENV config, id=%u\n", id);
 		return 0;
 	}
 
 	pr_info("Updating IP using ENV: %s\n", env_ip);
 	if (family == AF_INET) {
-		return handle_ipv4(env_ip, state, src_ip, dst_ip);
+		return handle_ipv4(env_ip, id, state, src_ip, dst_ip);
 	}
-	return handle_ipv6(env_ip, state, src_ip, dst_ip);
+	return handle_ipv6(env_ip, id, state, src_ip, dst_ip);
 }
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__UPDATE_INETSK, npu_plugin_update_inetsk)
