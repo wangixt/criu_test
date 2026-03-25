@@ -17,6 +17,10 @@
  *     Example:
  *       src=/home/b,dst=/home/b,options=rbind:rw;src=/data,dst=/data,options=rbind:ro
  *
+ *   CRIU_MOVE_MOUNT_LOG    (optional) Path to a debug log file.
+ *                          Default: /tmp/criu-move-mount.log
+ *                          Set to "" to disable file logging.
+ *
  * Mount mechanism (requires Linux 5.2+):
  *   1. open_tree(src, OPEN_TREE_CLONE)  — clone the source mount in host ns
  *   2. setns(container_mntns)           — switch to the container's mnt ns
@@ -29,6 +33,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <sched.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -44,6 +49,45 @@
 #ifndef MOVE_MOUNT_F_EMPTY_PATH
 #define MOVE_MOUNT_F_EMPTY_PATH 0x00000004
 #endif
+
+#define DEFAULT_LOG_PATH "/tmp/criu-move-mount.log"
+
+static FILE *g_logfp;
+
+static void log_open(void)
+{
+	const char *path = getenv("CRIU_MOVE_MOUNT_LOG");
+
+	if (!path)
+		path = DEFAULT_LOG_PATH;
+	if (!*path)
+		return;
+
+	g_logfp = fopen(path, "a");
+}
+
+static void log_close(void)
+{
+	if (g_logfp)
+		fclose(g_logfp);
+}
+
+__attribute__((format(printf, 1, 2)))
+static void logmsg(const char *fmt, ...)
+{
+	va_list ap;
+
+	va_start(ap, fmt);
+	vfprintf(stderr, fmt, ap);
+	va_end(ap);
+
+	if (g_logfp) {
+		va_start(ap, fmt);
+		vfprintf(g_logfp, fmt, ap);
+		va_end(ap);
+		fflush(g_logfp);
+	}
+}
 
 /* Recursively create directories (like mkdir -p). */
 static int mkdir_p(const char *path, mode_t mode)
@@ -75,9 +119,12 @@ static int apply_mount(int host_nsfd, int container_nsfd,
 	unsigned int flags;
 	int treefd;
 
+	logmsg("add-mounts: mounting %s -> %s (rbind=%d, ro=%d)\n",
+	       src, dst, rbind, ro);
+
 	/* Make sure we are in the host namespace for open_tree(). */
 	if (setns(host_nsfd, CLONE_NEWNS) < 0) {
-		perror("setns host");
+		logmsg("add-mounts: setns host: %s\n", strerror(errno));
 		return -1;
 	}
 
@@ -87,37 +134,38 @@ static int apply_mount(int host_nsfd, int container_nsfd,
 
 	treefd = syscall(__NR_open_tree, AT_FDCWD, src, flags);
 	if (treefd < 0) {
-		perror("open_tree");
+		logmsg("add-mounts: open_tree(%s): %s\n", src, strerror(errno));
 		return -1;
 	}
 
 	/* Switch to the container namespace. */
 	if (setns(container_nsfd, CLONE_NEWNS) < 0) {
-		perror("setns container");
+		logmsg("add-mounts: setns container: %s\n", strerror(errno));
 		close(treefd);
 		return -1;
 	}
 
 	if (mkdir_p(dst, 0755) < 0) {
-		perror("mkdir_p");
+		logmsg("add-mounts: mkdir_p(%s): %s\n", dst, strerror(errno));
 		close(treefd);
 		return -1;
 	}
 
 	if (syscall(__NR_move_mount, treefd, "", AT_FDCWD, dst,
 		    MOVE_MOUNT_F_EMPTY_PATH) < 0) {
-		perror("move_mount");
+		logmsg("add-mounts: move_mount(%s): %s\n", dst, strerror(errno));
 		close(treefd);
 		return -1;
 	}
 
 	if (ro && mount(NULL, dst, NULL,
 			MS_REMOUNT | MS_BIND | MS_RDONLY, NULL) < 0) {
-		perror("remount ro");
+		logmsg("add-mounts: remount ro(%s): %s\n", dst, strerror(errno));
 		close(treefd);
 		return -1;
 	}
 
+	logmsg("add-mounts: OK %s -> %s\n", src, dst);
 	close(treefd);
 	return 0;
 }
@@ -162,14 +210,12 @@ static int parse_and_apply(int host_nsfd, int container_nsfd, const char *spec)
 	}
 
 	if (!src || !*src || !dst || !*dst) {
-		fprintf(stderr, "add-mounts: bad spec: %s\n", spec);
+		logmsg("add-mounts: bad spec (missing src or dst): %s\n", spec);
 		free(buf);
 		return -1;
 	}
 
 	int rc = apply_mount(host_nsfd, container_nsfd, src, dst, rbind, ro);
-	if (rc < 0)
-		fprintf(stderr, "add-mounts: FAILED %s -> %s\n", src, dst);
 
 	free(buf);
 	return rc;
@@ -194,63 +240,86 @@ int main(void)
 	char ns_path[64];
 	int host_nsfd, container_nsfd;
 	char *mounts, *saveptr, *entry;
-	int initpid, ret = 0;
+	int initpid;
+
+	log_open();
+
+	action = getenv("CRTOOLS_SCRIPT_ACTION");
+	logmsg("add-mounts: action=%s\n", action ? action : "(null)");
 
 	/*
 	 * Phase filter — only run during pre-resume.
 	 * Exit silently (success) for all other phases so CRIU continues
 	 * the restore without error.
 	 */
-	action = getenv("CRTOOLS_SCRIPT_ACTION");
-	if (!action || strcmp(action, "pre-resume") != 0)
+	if (!action || strcmp(action, "pre-resume") != 0) {
+		log_close();
 		return 0;
+	}
 
 	initpid_str = getenv("CRTOOLS_INIT_PID");
 	if (!initpid_str || !*initpid_str) {
-		fprintf(stderr, "add-mounts: CRTOOLS_INIT_PID not set\n");
+		logmsg("add-mounts: CRTOOLS_INIT_PID not set\n");
+		log_close();
 		return 1;
 	}
 	initpid = atoi(initpid_str);
 
 	mounts_env = getenv("CRIU_ADD_MOUNTS");
-	if (!mounts_env || !*mounts_env)
+	logmsg("add-mounts: pid=%d, CRIU_ADD_MOUNTS=%s\n",
+	       initpid, mounts_env ? mounts_env : "(null)");
+
+	if (!mounts_env || !*mounts_env) {
+		logmsg("add-mounts: no rules, nothing to do\n");
+		log_close();
 		return 0;
+	}
 
 	/* Open the container's mount namespace fd. */
 	snprintf(ns_path, sizeof(ns_path), "/proc/%d/ns/mnt", initpid);
 	container_nsfd = open(ns_path, O_RDONLY);
 	if (container_nsfd < 0) {
-		perror("open container mntns");
+		logmsg("add-mounts: open(%s): %s\n", ns_path, strerror(errno));
+		log_close();
 		return 1;
 	}
 
 	/* Save the host mount namespace so we can switch back for each rule. */
 	host_nsfd = open("/proc/self/ns/mnt", O_RDONLY);
 	if (host_nsfd < 0) {
-		perror("open host mntns");
+		logmsg("add-mounts: open(/proc/self/ns/mnt): %s\n",
+		       strerror(errno));
 		close(container_nsfd);
+		log_close();
 		return 1;
 	}
 
 	mounts = strdup(mounts_env);
 	if (!mounts) {
-		perror("strdup");
+		logmsg("add-mounts: strdup: %s\n", strerror(errno));
 		close(container_nsfd);
 		close(host_nsfd);
+		log_close();
 		return 1;
 	}
 
+	/*
+	 * Individual mount failures are logged but do not abort the whole
+	 * process — matching the original shell script's "|| true" behaviour.
+	 * This prevents one bad rule from blocking other valid mounts and
+	 * avoids failing the entire CRIU restore.
+	 */
 	for (entry = strtok_r(mounts, ";", &saveptr); entry;
 	     entry = strtok_r(NULL, ";", &saveptr)) {
 		entry = trim(entry);
 		if (!*entry)
 			continue;
-		if (parse_and_apply(host_nsfd, container_nsfd, entry) < 0)
-			ret = 1;
+		parse_and_apply(host_nsfd, container_nsfd, entry);
 	}
 
 	free(mounts);
 	close(container_nsfd);
 	close(host_nsfd);
-	return ret;
+	log_close();
+	return 0;
 }
